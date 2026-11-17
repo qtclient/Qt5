@@ -1,6 +1,6 @@
 ---
 # Build and publish the qtclient Qt kits for every commit on master:
-# ghcr.io/qtclient/qt:<sha12>-<kit> + GitHub Release qt-<sha12>.
+# ghcr.io/qtclient/qt5:<sha12>-<kit> + GitHub Release qt-<sha12>.
 # qtclient pins this repository as third_party/qt5-cip and pulls those kits.
 name: 'qtclient kits'
 
@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/qtclient/qt
+  IMAGE: ghcr.io/qtclient/qt5
   # Modules the kits build (sparse checkout; the rest are -skip'ed).
   SPARSE: |
     cmake

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Publish an installed kit of this tree:
-#   ghcr.io/qtclient/qt:<sha12>-<kit>          (OCI artifact, qt-prefix.tar.zst)
+#   ghcr.io/qtclient/qt5:<sha12>-<kit>          (OCI artifact, qt-prefix.tar.zst)
 #   GitHub Release qt-<sha12>, asset qt-<sha12>-<kit>.tar.zst on this repository
 #
 #   qtclient/publish-kit.sh <kit> <prefix>
@@ -13,7 +13,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KIT="${1:?usage: $0 <kit> <prefix>}"
 PREFIX="${2:?usage: $0 <kit> <prefix>}"
-IMAGE="${QT_GHCR_IMAGE:-ghcr.io/qtclient/qt}"
+IMAGE="${QT_GHCR_IMAGE:-ghcr.io/qtclient/qt5}"
 SHORT="$(git -C "$HERE" rev-parse --short=12 HEAD)"
 TAG="${SHORT}-${KIT}"
 

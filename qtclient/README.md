@@ -26,7 +26,7 @@ Every push to `master` runs **qtclient kits** (`.github/workflows/qtclient-kits.
 `macos-arm64`, `linux-x64`, `windows-x64` and `wasm_multithread` (JSPI + native
 wasm exceptions, Emscripten from `qtclient/emsdk-version`), published as
 
-- `ghcr.io/qtclient/qt:<sha12>-<kit>` (OCI artifact, `qt-prefix.tar.zst`), and
+- `ghcr.io/qtclient/qt5:<sha12>-<kit>` (OCI artifact, `qt-prefix.tar.zst`), and
 - GitHub Release `qt-<sha12>` here, asset `qt-<sha12>-<kit>.tar.zst`.
 
 A kit already published for the commit is not rebuilt.
