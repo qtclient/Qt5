@@ -1,0 +1,149 @@
+---
+# Build and publish the qtclient Qt kits for every commit on master:
+# ghcr.io/qtclient/qt:<sha12>-<kit> + GitHub Release qt-<sha12>.
+# qtclient pins this repository as third_party/qt5-cip and pulls those kits.
+name: 'qtclient kits'
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: qtclient-kits-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/qtclient/qt
+  # Modules the kits build (sparse checkout; the rest are -skip'ed).
+  SPARSE: |
+    cmake
+    coin
+    qtbase
+    qtsvg
+    qtdeclarative
+    qtimageformats
+    qtshadertools
+    qt5compat
+    qtnetworkauth
+    qtwebsockets
+    qtwebchannel
+    qtlanguageserver
+    qtclient
+
+jobs:
+  desktop:
+    name: ${{ matrix.kit }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kit: macos-arm64
+            runner: macos-15
+          - kit: linux-x64
+            runner: ubuntu-24.04
+          - kit: windows-x64
+            runner: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ${{ env.SPARSE }}
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Already published?
+        id: published
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if oras manifest fetch "$IMAGE:${GITHUB_SHA::12}-${{ matrix.kit }}" >/dev/null 2>&1; then
+            echo "yes=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build deps (Linux)
+        if: steps.published.outputs.yes != '1' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zstd libgl1-mesa-dev libxkbcommon-dev \
+            libx11-xcb-dev libxcb-cursor-dev libxcb-xinerama0-dev \
+            libfontconfig1-dev libfreetype6-dev libdbus-1-dev
+      - name: Build deps (macOS)
+        if: steps.published.outputs.yes != '1' && runner.os == 'macOS'
+        run: brew install ninja zstd
+      - name: Build deps (Windows)
+        if: steps.published.outputs.yes != '1' && runner.os == 'Windows'
+        run: |
+          choco install zstandard -y --no-progress
+          echo "/c/ProgramData/chocolatey/bin" >> "$GITHUB_PATH"
+      - uses: lukka/get-cmake@v4.3.4
+        if: steps.published.outputs.yes != '1'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: steps.published.outputs.yes != '1' && runner.os == 'Windows'
+
+      - name: Build
+        if: steps.published.outputs.yes != '1'
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        run: bash qtclient/build-kit.sh "${{ matrix.kit }}" "$RUNNER_TEMP/kit"
+
+      - name: Publish
+        if: steps.published.outputs.yes != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash qtclient/publish-kit.sh "${{ matrix.kit }}" "$RUNNER_TEMP/kit"
+
+  wasm:
+    name: wasm_multithread
+    needs: desktop
+    # Only the linux-x64 host kit matters here; another desktop kit failing
+    # must not block wasm.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ${{ env.SPARSE }}
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Already published?
+        id: published
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if oras manifest fetch "$IMAGE:${GITHUB_SHA::12}-wasm_multithread" >/dev/null 2>&1; then
+            echo "yes=1" >> "$GITHUB_OUTPUT"
+          fi
+          echo "emsdk=$(cat qtclient/emsdk-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Host kit (linux-x64 of this commit)
+        if: steps.published.outputs.yes != '1'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zstd
+          mkdir -p "$RUNNER_TEMP/pull" "$RUNNER_TEMP/host"
+          oras pull "$IMAGE:${GITHUB_SHA::12}-linux-x64" -o "$RUNNER_TEMP/pull"
+          zstd -d -c "$RUNNER_TEMP/pull/qt-prefix.tar.zst" | tar -xf - -C "$RUNNER_TEMP/host"
+
+      - uses: mymindstorm/setup-emsdk@v14
+        if: steps.published.outputs.yes != '1'
+        with:
+          version: ${{ steps.published.outputs.emsdk }}
+      - uses: lukka/get-cmake@v4.3.4
+        if: steps.published.outputs.yes != '1'
+
+      - name: Build
+        if: steps.published.outputs.yes != '1'
+        run: bash qtclient/build-kit.sh wasm_multithread "$RUNNER_TEMP/kit" "$RUNNER_TEMP/host"
+
+      - name: Publish
+        if: steps.published.outputs.yes != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash qtclient/publish-kit.sh wasm_multithread "$RUNNER_TEMP/kit"
