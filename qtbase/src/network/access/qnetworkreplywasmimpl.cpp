@@ -335,7 +335,10 @@ void QNetworkReplyWasmImplPrivate::doSendRequest()
         default:
             break;
         }
-        if (request.attribute(QNetworkRequest::RedirectPolicyAttribute).toInt()
+        // Unset means the manager's default (it only sets other policies), which
+        // follows redirects; 0 is ManualRedirectPolicy, so never toInt() it bare.
+        if (request.attribute(QNetworkRequest::RedirectPolicyAttribute,
+                              QNetworkRequest::NoLessSafeRedirectPolicy).toInt()
             == QNetworkRequest::ManualRedirectPolicy)
             init.set("redirect", val("manual"));
 
