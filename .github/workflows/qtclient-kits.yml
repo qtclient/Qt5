@@ -126,7 +126,10 @@ jobs:
         if: steps.published.outputs.yes != '1'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build zstd
+          # The host kit's tools (qsb, moc, rcc…) run during the build: they
+          # need its runtime libraries (GL/EGL, xkbcommon, fontconfig).
+          sudo apt-get install -y ninja-build zstd libegl1 libgl1 libopengl0 \
+            libxkbcommon0 libfontconfig1 libfreetype6 libdbus-1-3 libglib2.0-0t64
           mkdir -p "$RUNNER_TEMP/pull" "$RUNNER_TEMP/host"
           oras pull "$IMAGE:${GITHUB_SHA::12}-linux-x64" -o "$RUNNER_TEMP/pull"
           zstd -d -c "$RUNNER_TEMP/pull/qt-prefix.tar.zst" | tar -xf - -C "$RUNNER_TEMP/host"
