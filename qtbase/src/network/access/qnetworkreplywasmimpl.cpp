@@ -9,6 +9,7 @@
 #include <QtCore/qcoreapplication.h>
 #include <QtCore/qfileinfo.h>
 #include <QtCore/qthread.h>
+#include <QtCore/private/qstdweb_p.h>
 #include <QtCore/private/qwasmglobal_p.h>
 #include <QtCore/private/qoffsetstringarray_p.h>
 #include <QtCore/private/qtools_p.h>
@@ -17,7 +18,7 @@
 #include <private/qnetworkfile_p.h>
 
 #include <emscripten.h>
-#include <emscripten/fetch.h>
+#include <emscripten/val.h>
 
 QT_BEGIN_NAMESPACE
 
@@ -59,11 +60,11 @@ bool isUnsafeHeader(QLatin1StringView header) noexcept
 QNetworkReplyWasmImplPrivate::QNetworkReplyWasmImplPrivate()
     : QNetworkReplyPrivate()
     , managerPrivate(0)
+    , bytesDownloaded(0)
     , downloadBufferReadPosition(0)
     , downloadBufferCurrentSize(0)
     , totalDownloadSize(0)
     , percentFinished(0)
-    , m_fetch(nullptr)
     , m_fetchContext(nullptr)
 {
 }
@@ -77,8 +78,18 @@ QNetworkReplyWasmImplPrivate::~QNetworkReplyWasmImplPrivate()
         if (m_fetchContext->state == FetchContext::State::SCHEDULED
             || m_fetchContext->state == FetchContext::State::SENT
             || m_fetchContext->state == FetchContext::State::CANCELED) {
+            // The in-flight promise's callback frees the context; aborting
+            // makes it settle now instead of when the transfer ends.
+            const bool sent = m_fetchContext->state == FetchContext::State::SENT;
             m_fetchContext->reply = nullptr;
             m_fetchContext->state = FetchContext::State::TO_BE_DESTROYED;
+            if (sent) {
+                FetchContext *context = m_fetchContext;
+                lock.unlock();
+                qwasmglobal::runOnMainThreadAsync([context]() {
+                    context->abortController.call<void>("abort");
+                });
+            }
         } else if (m_fetchContext->state == FetchContext::State::FINISHED) {
             lock.unlock();
             delete m_fetchContext;
@@ -128,9 +139,6 @@ void QNetworkReplyWasmImpl::close()
 {
     Q_D(QNetworkReplyWasmImpl);
 
-    if (!d->m_fetch)
-        return;
-    emscripten_fetch_close(d->m_fetch);
     if (d->state != QNetworkReplyPrivate::Aborted &&
         d->state != QNetworkReplyPrivate::Finished &&
         d->state != QNetworkReplyPrivate::Idle) {
@@ -138,7 +146,6 @@ void QNetworkReplyWasmImpl::close()
             d->setCanceled();
     }
     QNetworkReply::close();
-    d->m_fetch = nullptr;
 }
 
 void QNetworkReplyWasmImpl::abort()
@@ -157,10 +164,18 @@ void QNetworkReplyWasmImplPrivate::setCanceled()
     Q_Q(QNetworkReplyWasmImpl);
     {
         if (m_fetchContext) {
-            std::scoped_lock lock{ m_fetchContext->mutex };
+            std::unique_lock lock{ m_fetchContext->mutex };
+            const bool sent = m_fetchContext->state == FetchContext::State::SENT;
             if (m_fetchContext->state == FetchContext::State::SCHEDULED
                 || m_fetchContext->state == FetchContext::State::SENT)
                 m_fetchContext->state = FetchContext::State::CANCELED;
+            if (sent) {
+                FetchContext *context = m_fetchContext;
+                lock.unlock();
+                qwasmglobal::runOnMainThreadAsync([context]() {
+                    context->abortController.call<void>("abort");
+                });
+            }
         }
     }
 
@@ -196,6 +211,12 @@ qint64 QNetworkReplyWasmImpl::readData(char *data, qint64 maxlen)
     qint64 howMuch = qMin(maxlen, (d->downloadBuffer.size() - d->downloadBufferReadPosition));
     memcpy(data, d->downloadBuffer.constData() + d->downloadBufferReadPosition, howMuch);
     d->downloadBufferReadPosition += howMuch;
+    // Everything read: drop the buffered bytes (a long body streams through).
+    if (d->downloadBufferReadPosition == d->downloadBuffer.size()) {
+        d->downloadBuffer.clear();
+        d->downloadBufferReadPosition = 0;
+        d->downloadBufferCurrentSize = 0;
+    }
 
     return howMuch;
 }
@@ -243,49 +264,22 @@ void QNetworkReplyWasmImplPrivate::setReplyAttributes(quintptr data, int statusC
         handler->q_func()->setAttribute(QNetworkRequest::HttpReasonPhraseAttribute, statusReason);
 }
 
-constexpr int getArraySize (int factor) {
-    return 2 * factor + 1;
-}
-
 void QNetworkReplyWasmImplPrivate::doSendRequest()
 {
     Q_Q(QNetworkReplyWasmImpl);
     totalDownloadSize = 0;
 
-    emscripten_fetch_attr_t attr;
-    emscripten_fetch_attr_init(&attr);
-    qstrncpy(attr.requestMethod, q->methodName().constData(), 32);  // requestMethod is char[32] in emscripten
-
-    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
-
-    QNetworkRequest::CacheLoadControl CacheLoadControlAttribute =
-        (QNetworkRequest::CacheLoadControl)request.attribute(QNetworkRequest::CacheLoadControlAttribute, QNetworkRequest::PreferNetwork).toInt();
-
-    if (CacheLoadControlAttribute == QNetworkRequest::AlwaysCache) {
-        attr.attributes += EMSCRIPTEN_FETCH_NO_DOWNLOAD;
+    m_fetchContext = new FetchContext(this);
+    if (outgoingDataBuffer) { // sequential upload data, buffered by _q_bufferOutgoingData
+        m_fetchContext->requestData.resize(outgoingDataBuffer->size());
+        outgoingDataBuffer->read(m_fetchContext->requestData.data(), outgoingDataBuffer->size());
     }
-    if (CacheLoadControlAttribute == QNetworkRequest::PreferCache) {
-         attr.attributes += EMSCRIPTEN_FETCH_APPEND;
-    }
+    else if (outgoingData)
+        m_fetchContext->requestData = outgoingData->readAll();
 
-    attr.withCredentials = request.attribute(QNetworkRequest::UseCredentialsAttribute, false).toBool();
-    attr.onsuccess = QNetworkReplyWasmImplPrivate::downloadSucceeded;
-    attr.onerror = QNetworkReplyWasmImplPrivate::downloadFailed;
-    attr.onprogress = QNetworkReplyWasmImplPrivate::downloadProgress;
-    attr.onreadystatechange = QNetworkReplyWasmImplPrivate::stateChange;
-    attr.timeoutMSecs = request.transferTimeout();
-
-    m_fetchContext = new FetchContext(this);;
-    attr.userData = static_cast<void *>(m_fetchContext);
-    if (outgoingData) { // data from post request
-        m_fetchContext->requestData = outgoingData->readAll(); // is there a size restriction here?
-        if (!m_fetchContext->requestData.isEmpty()) {
-            attr.requestData = m_fetchContext->requestData.data();
-            attr.requestDataSize = m_fetchContext->requestData.size();
-        }
-    }
-
-    qwasmglobal::runOnMainThread([attr, fetchContext = m_fetchContext]() mutable {
+    const QByteArray method = q->methodName();
+    qwasmglobal::runOnMainThread([method, fetchContext = m_fetchContext]() {
+        using emscripten::val;
         std::unique_lock lock{ fetchContext->mutex };
         if (fetchContext->state == FetchContext::State::CANCELED) {
             fetchContext->state = FetchContext::State::FINISHED;
@@ -298,44 +292,178 @@ void QNetworkReplyWasmImplPrivate::doSendRequest()
         const auto reply = fetchContext->reply;
         const auto &request = reply->request;
 
-        QByteArray userName, password;
-        if (!request.url().userInfo().isEmpty()) {
-            userName = request.url().userName().toUtf8();
-            password = request.url().password().toUtf8();
-            attr.userName = userName.constData();
-            attr.password = password.constData();
-        }
-
-        QList<QByteArray> headersData = request.rawHeaderList();
-        int arrayLength = getArraySize(headersData.count());
-        const char *customHeaders[arrayLength];
+        val headers = val::global("Headers").new_();
         QStringList trimmedHeaders;
-        if (headersData.count() > 0) {
-            int i = 0;
-            for (const auto &headerName : headersData) {
-                if (isUnsafeHeader(QLatin1StringView(headerName.constData()))) {
-                    trimmedHeaders.push_back(QString::fromLatin1(headerName));
-                } else {
-                    customHeaders[i++] = headerName.constData();
-                    customHeaders[i++] = request.rawHeader(headerName).constData();
-                }
+        for (const auto &headerName : request.rawHeaderList()) {
+            if (isUnsafeHeader(QLatin1StringView(headerName.constData()))) {
+                trimmedHeaders.push_back(QString::fromLatin1(headerName));
+                continue;
             }
-            if (!trimmedHeaders.isEmpty()) {
-                qWarning() << "Qt has trimmed the following forbidden headers from the request:"
-                           << trimmedHeaders.join(QLatin1StringView(", "));
-            }
-            customHeaders[i] = nullptr;
-            attr.requestHeaders = customHeaders;
+            headers.call<void>("append", val(headerName.toStdString()),
+                               val(request.rawHeader(headerName).toStdString()));
+        }
+        if (!trimmedHeaders.isEmpty()) {
+            qWarning() << "Qt has trimmed the following forbidden headers from the request:"
+                       << trimmedHeaders.join(QLatin1StringView(", "));
+        }
+        // fetch() rejects credentials in the URL: send them as Basic auth.
+        QUrl url = request.url();
+        if (!url.userInfo().isEmpty()) {
+            const QByteArray credentials = url.userName().toUtf8() + ':' + url.password().toUtf8();
+            headers.call<void>("set", val("Authorization"),
+                               val("Basic " + credentials.toBase64().toStdString()));
+            url.setUserInfo(QString());
         }
 
-        auto url = request.url().toString().toUtf8();
-        QString dPath = "/home/web_user/"_L1 + request.url().fileName();
-        QByteArray destinationPath = dPath.toUtf8();
-        attr.destinationPath = destinationPath.constData();
-        reply->m_fetch = emscripten_fetch(&attr, url.constData());
+        val init = val::object();
+        init.set("method", val(method.toStdString()));
+        init.set("headers", headers);
+        if (!fetchContext->requestData.isEmpty())
+            init.set("body", qstdweb::Uint8Array::copyFrom(fetchContext->requestData).val());
+        const bool withCredentials =
+                request.attribute(QNetworkRequest::UseCredentialsAttribute, false).toBool();
+        init.set("credentials", val(withCredentials ? "include" : "same-origin"));
+        switch (request.attribute(QNetworkRequest::CacheLoadControlAttribute,
+                                  QNetworkRequest::PreferNetwork).toInt()) {
+        case QNetworkRequest::AlwaysNetwork:
+            init.set("cache", val("no-store"));
+            break;
+        case QNetworkRequest::PreferCache:
+        case QNetworkRequest::AlwaysCache:
+            init.set("cache", val("force-cache"));
+            break;
+        default:
+            break;
+        }
+        if (request.attribute(QNetworkRequest::RedirectPolicyAttribute).toInt()
+            == QNetworkRequest::ManualRedirectPolicy)
+            init.set("redirect", val("manual"));
+
+        fetchContext->abortController = val::global("AbortController").new_();
+        val signal = fetchContext->abortController["signal"];
+        if (const int timeout = request.transferTimeout(); timeout > 0) {
+            val abortSignals = val::array();
+            abortSignals.call<void>("push", signal);
+            abortSignals.call<void>("push", val::global("AbortSignal").call<val>("timeout", timeout));
+            signal = val::global("AbortSignal").call<val>("any", abortSignals);
+        }
+        init.set("signal", signal);
+
+        val promise = val::global("fetch")(val(url.toString().toStdString()), init);
         fetchContext->state = FetchContext::State::SENT;
+        lock.unlock();
+        qstdweb::PromiseCallbacks callbacks;
+        callbacks.thenFunc = [fetchContext](val response) { responseReceived(fetchContext, response); };
+        callbacks.catchFunc = [fetchContext](val error) { fetchFailed(fetchContext, error); };
+        qstdweb::Promise::adoptPromise(promise, std::move(callbacks));
     });
     state = Working;
+}
+
+QNetworkReplyWasmImplPrivate *QNetworkReplyWasmImplPrivate::liveReply(FetchContext *context,
+                                                                       bool finalStep)
+{
+    std::unique_lock lock{ context->mutex };
+    switch (context->state) {
+    case FetchContext::State::SENT:
+        if (finalStep)
+            context->state = FetchContext::State::FINISHED;
+        return context->reply;
+    case FetchContext::State::TO_BE_DESTROYED:
+        lock.unlock();
+        delete context;
+        return nullptr;
+    case FetchContext::State::CANCELED:
+        // The reply already reported the cancel; stop here.
+        context->state = FetchContext::State::FINISHED;
+        return nullptr;
+    default:
+        return nullptr;
+    }
+}
+
+void QNetworkReplyWasmImplPrivate::responseReceived(FetchContext *context, emscripten::val response)
+{
+    using emscripten::val;
+    const auto reply = liveReply(context, false);
+    if (!reply)
+        return;
+    context->status = response["status"].as<int>();
+    reply->setStatusCode(context->status, QByteArray::fromStdString(response["statusText"].as<std::string>()));
+
+    QByteArray headerText;
+    val entries = val::global("Array").call<val>("from", response["headers"].call<val>("entries"));
+    const int count = entries["length"].as<int>();
+    for (int i = 0; i < count; ++i) {
+        val entry = entries[i];
+        headerText += QByteArray::fromStdString(entry[0].as<std::string>()) + ": "
+                + QByteArray::fromStdString(entry[1].as<std::string>()) + '\n';
+    }
+    const val contentLength = response["headers"].call<val>("get", val("content-length"));
+    context->total = contentLength.isString()
+            ? QByteArray::fromStdString(contentLength.as<std::string>()).toLongLong()
+            : 0;
+    reply->headersReceived(headerText);
+
+    val body = response["body"];
+    if (body.isNull() || body.isUndefined()) {
+        val done = val::object();
+        done.set("done", true);
+        chunkReceived(context, done);
+        return;
+    }
+    context->reader = body.call<val>("getReader");
+    readNextChunk(context);
+}
+
+void QNetworkReplyWasmImplPrivate::readNextChunk(FetchContext *context)
+{
+    using emscripten::val;
+    qstdweb::PromiseCallbacks callbacks;
+    callbacks.thenFunc = [context](val result) { chunkReceived(context, result); };
+    callbacks.catchFunc = [context](val error) { fetchFailed(context, error); };
+    qstdweb::Promise::adoptPromise(context->reader.call<val>("read"), std::move(callbacks));
+}
+
+void QNetworkReplyWasmImplPrivate::chunkReceived(FetchContext *context, emscripten::val result)
+{
+    const bool done = result["done"].as<bool>();
+    const auto reply = liveReply(context, done);
+    if (!reply)
+        return;
+    if (!done) {
+        const QByteArray chunk = qstdweb::Uint8Array(result["value"]).copyToQByteArray();
+        context->received += chunk.size();
+        reply->dataReceived(chunk);
+        reply->emitDataReadProgress(context->received,
+                                    context->total > 0 ? context->total : context->received);
+        readNextChunk(context);
+        return;
+    }
+    if (context->status >= 400) {
+        reply->emitReplyError(statusCodeFromHttp(context->status, reply->request.url()),
+                              reply->q_func()->attribute(QNetworkRequest::HttpReasonPhraseAttribute)
+                                      .toString());
+    }
+    reply->setReplyFinished();
+}
+
+void QNetworkReplyWasmImplPrivate::fetchFailed(FetchContext *context, emscripten::val error)
+{
+    const auto reply = liveReply(context, true);
+    if (!reply)
+        return;
+    const std::string name = error["name"].isString() ? error["name"].as<std::string>() : std::string();
+    const QString message = error["message"].isString()
+            ? QString::fromStdString(error["message"].as<std::string>())
+            : QStringLiteral("Network error");
+    if (name == "TimeoutError")
+        reply->emitReplyError(QNetworkReply::TimeoutError, QStringLiteral("Operation timed out"));
+    else if (name == "AbortError")
+        reply->emitReplyError(QNetworkReply::OperationCanceledError, QStringLiteral("Operation canceled"));
+    else
+        reply->emitReplyError(QNetworkReply::UnknownNetworkError, message);
+    reply->setReplyFinished();
 }
 
 void QNetworkReplyWasmImplPrivate::emitReplyError(QNetworkReply::NetworkError errorCode, const QString &errorString)
@@ -351,8 +479,7 @@ void QNetworkReplyWasmImplPrivate::emitDataReadProgress(qint64 bytesReceived, qi
     Q_Q(QNetworkReplyWasmImpl);
 
     totalDownloadSize = bytesTotal;
-
-    percentFinished = bytesTotal ? (bytesReceived / bytesTotal) * 100 : 100;
+    percentFinished = bytesTotal ? (bytesReceived * 100) / bytesTotal : 100;
 
     emit q->downloadProgress(bytesReceived, bytesTotal);
 }
@@ -362,18 +489,10 @@ void QNetworkReplyWasmImplPrivate::dataReceived(const QByteArray &buffer)
     Q_Q(QNetworkReplyWasmImpl);
 
     const qsizetype bufferSize = buffer.size();
-    if (bufferSize > 0)
-        q->setReadBufferSize(bufferSize);
-
-    bytesDownloaded = bufferSize;
-
-    if (percentFinished != 100)
-        downloadBufferCurrentSize += bufferSize;
-    else
-        downloadBufferCurrentSize = bufferSize;
-
-    totalDownloadSize = downloadBufferCurrentSize;
-
+    if (bufferSize == 0)
+        return;
+    bytesDownloaded += bufferSize;
+    downloadBufferCurrentSize += bufferSize;
     downloadBuffer.append(buffer);
 
     emit q->readyRead();
@@ -513,32 +632,6 @@ void QNetworkReplyWasmImplPrivate::_q_bufferOutgoingData()
     }
 }
 
-void QNetworkReplyWasmImplPrivate::downloadSucceeded(emscripten_fetch_t *fetch)
-{
-    auto fetchContext = static_cast<FetchContext *>(fetch->userData);
-    std::unique_lock lock{ fetchContext->mutex };
-
-    if (fetchContext->state == FetchContext::State::TO_BE_DESTROYED) {
-        lock.unlock();
-        delete fetchContext;
-        return;
-    } else if (fetchContext->state == FetchContext::State::CANCELED) {
-        fetchContext->state = FetchContext::State::FINISHED;
-        return;
-    } else if (fetchContext->state == FetchContext::State::SENT) {
-        const auto reply = fetchContext->reply;
-        if (reply->state != QNetworkReplyPrivate::Aborted) {
-            QByteArray statusText(fetch->statusText);
-            reply->setStatusCode(fetch->status, statusText);
-            QByteArray buffer(fetch->data, fetch->numBytes);
-            reply->dataReceived(buffer);
-            reply->setReplyFinished();
-        }
-        reply->m_fetch = nullptr;
-        fetchContext->state = FetchContext::State::FINISHED;
-    }
-}
-
 void QNetworkReplyWasmImplPrivate::setReplyFinished()
 {
     Q_Q(QNetworkReplyWasmImpl);
@@ -553,68 +646,6 @@ void QNetworkReplyWasmImplPrivate::setStatusCode(int status, const QByteArray &s
     Q_Q(QNetworkReplyWasmImpl);
     q->setAttribute(QNetworkRequest::HttpStatusCodeAttribute, status);
     q->setAttribute(QNetworkRequest::HttpReasonPhraseAttribute, statusText);
-}
-
-void QNetworkReplyWasmImplPrivate::stateChange(emscripten_fetch_t *fetch)
-{
-    const auto fetchContext = static_cast<FetchContext*>(fetch->userData);
-    const auto reply = fetchContext->reply;
-    if (reply && reply->state != QNetworkReplyPrivate::Aborted) {
-        if (fetch->readyState == /*HEADERS_RECEIVED*/ 2) {
-            size_t headerLength = emscripten_fetch_get_response_headers_length(fetch);
-            QByteArray str(headerLength, Qt::Uninitialized);
-            emscripten_fetch_get_response_headers(fetch, str.data(), str.size());
-            reply->headersReceived(str);
-        }
-    }
-}
-
-void QNetworkReplyWasmImplPrivate::downloadProgress(emscripten_fetch_t *fetch)
-{
-    const auto fetchContext = static_cast<FetchContext*>(fetch->userData);
-    const auto reply = fetchContext->reply;
-    if (reply && reply->state != QNetworkReplyPrivate::Aborted) {
-        if (fetch->status < 400) {
-            uint64_t bytes = fetch->dataOffset + fetch->numBytes;
-            uint64_t tBytes = fetch->totalBytes; // totalBytes can be 0 if server not reporting content length
-            if (tBytes == 0)
-                tBytes = bytes;
-            reply->emitDataReadProgress(bytes, tBytes);
-        }
-    }
-}
-
-void QNetworkReplyWasmImplPrivate::downloadFailed(emscripten_fetch_t *fetch)
-{
-    const auto fetchContext = static_cast<FetchContext*>(fetch->userData);
-    std::unique_lock lock{ fetchContext->mutex };
-
-    if (fetchContext->state == FetchContext::State::TO_BE_DESTROYED) {
-        lock.unlock();
-        delete fetchContext;
-        return;
-    } else if (fetchContext->state == FetchContext::State::CANCELED) {
-        fetchContext->state = FetchContext::State::FINISHED;
-        return;
-    } else if (fetchContext->state == FetchContext::State::SENT) {
-        const auto reply = fetchContext->reply;
-        if (reply->state != QNetworkReplyPrivate::Aborted) {
-            QString reasonStr;
-            if (fetch->status > 600)
-                reasonStr = QStringLiteral("Operation canceled");
-            else
-                reasonStr = QString::fromUtf8(fetch->statusText);
-            QByteArray statusText(fetch->statusText);
-            reply->setStatusCode(fetch->status, statusText);
-            QByteArray buffer(fetch->data, fetch->numBytes);
-            reply->dataReceived(buffer);
-            reply->emitReplyError(reply->statusCodeFromHttp(fetch->status, reply->request.url()),
-                                  reasonStr);
-            reply->setReplyFinished();
-        }
-        reply->m_fetch = nullptr;
-        fetchContext->state = FetchContext::State::FINISHED;
-    }
 }
 
 //taken from qhttpthreaddelegate.cpp
@@ -671,9 +702,6 @@ QNetworkReply::NetworkError QNetworkReplyWasmImplPrivate::statusCodeFromHttp(int
         code = QNetworkReply::ServiceUnavailableError;
         break;
 
-    case 65535: //emscripten reply when aborted
-        code =  QNetworkReply::OperationCanceledError;
-        break;
     default:
         if (httpStatusCode > 500) {
             // some kind of server error

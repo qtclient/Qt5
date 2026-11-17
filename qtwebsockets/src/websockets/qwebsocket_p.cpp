@@ -179,13 +179,15 @@ void QWebSocketPrivate::init()
 QWebSocketPrivate::~QWebSocketPrivate()
 {
 #ifdef Q_OS_WASM
-    if (m_socketContext) {
-        uint16_t m_readyState;
-        emscripten_websocket_get_ready_state(m_socketContext, &m_readyState);
-        if (m_readyState == 1 || m_readyState == 0) {
-            emscripten_websocket_close(m_socketContext, 1000,"");
-        }
-        emscripten_websocket_delete(m_socketContext);
+    // Drop the listeners first: no event may reach a destroyed socket.
+    m_onOpen.reset();
+    m_onMessage.reset();
+    m_onError.reset();
+    m_onClose.reset();
+    if (!m_socket.isUndefined()) {
+        const int readyState = m_socket["readyState"].as<int>();
+        if (readyState == 0 || readyState == 1) // CONNECTING, OPEN
+            m_socket.call<void>("close", 1000);
     }
 #endif
 }

@@ -39,11 +39,11 @@ qt_internal_add_module(WebSockets
 ## Scopes:
 #####################################################################
 
+# Uses the browser WebSocket API directly (QWasmEventHandler), not
+# Emscripten's websocket library.
 qt_internal_extend_target(WebSockets CONDITION WASM
     SOURCES
         qwebsocket_wasm_p.cpp
-    LIBRARIES
-        websocket.js
 )
 
 qt_internal_add_docs(WebSockets

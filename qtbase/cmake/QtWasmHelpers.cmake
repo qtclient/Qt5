@@ -10,7 +10,9 @@ function (qt_internal_setup_wasm_target_properties wasmTarget)
     "SHELL:-s WASM_BIGINT=1"
     "SHELL:-s STACK_SIZE=5MB")
 
-    set(executable_link_flags "-sFETCH")
+    # QNetworkReplyWasmImpl uses the browser fetch() API directly (through
+    # qstdweb promises), not Emscripten's fetch library.
+    set(executable_link_flags "")
     ## wasm64
     if (WASM64)
         target_compile_options("${wasmTarget}" INTERFACE "SHELL:-s MEMORY64=1" )

@@ -36,7 +36,9 @@
 #include "qdefaultmaskgenerator_p.h"
 
 #ifdef Q_OS_WASM
-#    include <emscripten/websocket.h>
+#    include <QtCore/private/qwasmsuspendresumecontrol_p.h>
+#    include <emscripten/val.h>
+#    include <memory>
 #endif
 
 QT_BEGIN_NAMESPACE
@@ -145,7 +147,7 @@ public:
     quint64 outgoingFrameSize() const;
     static quint64 maxOutgoingFrameSize();
 #ifdef Q_OS_WASM
-    void setSocketClosed(const EmscriptenWebSocketCloseEvent *emCloseEvent);
+    void setSocketClosed(int code, const QString &reason, bool wasClean);
     QString closeCodeToString(QWebSocketProtocol::CloseCode code);
 #endif
 private:
@@ -242,8 +244,13 @@ private:
 
     friend class QWebSocketServerPrivate;
 #ifdef Q_OS_WASM
-    EMSCRIPTEN_WEBSOCKET_T m_socketContext = 0;
-    uint16_t m_readyState = 0;
+    // The browser WebSocket; its events reach Qt through
+    // QWasmSuspendResumeControl (safe while the main thread is suspended).
+    emscripten::val m_socket = emscripten::val::undefined();
+    std::unique_ptr<QWasmEventHandler> m_onOpen;
+    std::unique_ptr<QWasmEventHandler> m_onMessage;
+    std::unique_ptr<QWasmEventHandler> m_onError;
+    std::unique_ptr<QWasmEventHandler> m_onClose;
 #endif
 };
 

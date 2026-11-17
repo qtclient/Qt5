@@ -26,7 +26,7 @@
 #include <private/qabstractfileengine_p.h>
 
 #include <emscripten.h>
-#include <emscripten/fetch.h>
+#include <emscripten/val.h>
 
 #include <memory>
 #include <mutex>
@@ -68,24 +68,30 @@ private:
 class QNetworkReplyWasmImplPrivate;
 
 /*!
-    The FetchContext class ensures the requestData object remains valid
-    while a fetch operation is pending. Since Emscripten fetch is asynchronous,
-    requestData must persist until one of the final callbacks is invoked.
-    Additionally, there's a potential race condition between the thread
-    scheduling the fetch operation and the one executing it. Since fetch must
-    occur on the main thread due to browser limitations,
-    a mutex safeguards the FetchContext to ensure atomic state transitions.
+    The FetchContext class ensures the request state remains valid while a
+    fetch is pending. The browser fetch runs on the main thread and reports
+    through promises adopted by QWasmSuspendResumeControl, so every callback
+    runs as a Qt event (safe under JSPI, where a raw JS-to-wasm call while the
+    main thread is suspended would run on its stack). Exactly one promise is in
+    flight per fetch; its callback frees the context once the reply is gone.
+    A mutex guards the state because the reply may be destroyed on another
+    thread.
 */
 struct FetchContext
 {
     enum class State { SCHEDULED, SENT, FINISHED, CANCELED, TO_BE_DESTROYED };
-
     FetchContext(QNetworkReplyWasmImplPrivate *networkReply) : reply(networkReply) { }
-
     QNetworkReplyWasmImplPrivate *reply{ nullptr };
     std::mutex mutex;
     QByteArray requestData;
     State state{ State::SCHEDULED };
+
+    // Main thread only.
+    emscripten::val abortController = emscripten::val::undefined();
+    emscripten::val reader = emscripten::val::undefined();
+    int status = 0;
+    qint64 received = 0;
+    qint64 total = 0;
 };
 
 class QNetworkReplyWasmImplPrivate: public QNetworkReplyPrivate
@@ -127,14 +133,17 @@ public:
     QIODevice *outgoingData;
     std::shared_ptr<QRingBuffer> outgoingDataBuffer;
 
-    static void downloadProgress(emscripten_fetch_t *fetch);
-    static void downloadFailed(emscripten_fetch_t *fetch);
-    static void downloadSucceeded(emscripten_fetch_t *fetch);
-    static void stateChange(emscripten_fetch_t *fetch);
+    // Fetch steps, on the main thread, each from an adopted promise.
+    static void responseReceived(FetchContext *context, emscripten::val response);
+    static void readNextChunk(FetchContext *context);
+    static void chunkReceived(FetchContext *context, emscripten::val result);
+    static void fetchFailed(FetchContext *context, emscripten::val error);
+    // Locks the context; returns the live reply, or null after handling a
+    // canceled / destroyed reply (the context may be freed then).
+    static QNetworkReplyWasmImplPrivate *liveReply(FetchContext *context, bool finalStep);
 
     static QNetworkReply::NetworkError statusCodeFromHttp(int httpStatusCode, const QUrl &url);
 
-    emscripten_fetch_t *m_fetch;
     FetchContext *m_fetchContext;
     void setReplyFinished();
     void setCanceled();
