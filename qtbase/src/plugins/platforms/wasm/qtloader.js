@@ -233,8 +233,26 @@ async function qtLoad(config)
         // Call main after creating the instance. We've opted into manually
         // calling main() by setting noInitialRun in the config. Thie Works around
         // issue where Emscripten suppresses all exceptions thrown during main.
-        if (!originalNoInitialRun)
-            instance.callMain(originalArguments);
+        //
+        // With JSPI, callMain returns a Promise (main is a promising export) and
+        // a Qt GUI main never settles it: it stays in exec(). Do not wait for it,
+        // but report a failure in main as onExit, as the synchronous path does.
+        if (!originalNoInitialRun) {
+            const mainResult = instance.callMain(originalArguments);
+            if (mainResult && typeof mainResult.then === 'function') {
+                mainResult.catch(e => {
+                    if (e == "unwind")
+                        return;
+                    if (!onExitCalled) {
+                        onExitCalled = true;
+                        config.qt.onExit?.({
+                            text: e && e.message ? e.message : String(e),
+                            crashed: true
+                        });
+                    }
+                });
+            }
+        }
     } catch (e) {
         // If this is the exception thrown by app.exec() then that is a normal
         // case and we suppress it.

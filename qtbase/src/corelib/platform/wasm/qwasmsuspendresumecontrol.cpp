@@ -165,16 +165,21 @@ int QWasmSuspendResumeControl::sendPendingEvents()
 #endif
     emscripten::val pendingEvents = suspendResumeControlJs()["pendingEvents"];
     int count = pendingEvents["length"].as<int>();
-    if (count == 0)
-        return false;
+    bool sent = false;
     while (count-- > 0) {
-        // Grab one event (handler and arg), and call it
+        // Grab one event (handler and arg), and call it. A handler may re-enter
+        // processEvents() (a nested event loop) and send the rest of the queue,
+        // and may remove handlers whose events are still queued.
         emscripten::val event = pendingEvents.call<val>("shift");
+        if (event.isUndefined())
+            break;
         auto it = m_eventHandlers.find(event["index"].as<int>());
-        Q_ASSERT(it != m_eventHandlers.end());
+        if (it == m_eventHandlers.end())
+            continue;
+        sent = true;
         it->second(event["arg"]);
     }
-    return count;
+    return sent;
 }
 
 void qtSendPendingEvents()
