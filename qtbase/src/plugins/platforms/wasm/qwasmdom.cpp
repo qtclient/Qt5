@@ -257,6 +257,11 @@ void syncCSSClassWith(emscripten::val element, std::string cssClassName, bool fl
 
 QPointF mapPoint(emscripten::val source, emscripten::val target, const QPointF &point)
 {
+    // An event handled after its dispatch can lose its target (shadow DOM
+    // retargeting clears it); calling a method on null would throw into Qt.
+    if (source.isNull() || source.isUndefined() || target.isNull() || target.isUndefined())
+        return point;
+
     const auto sourceBoundingRect =
             QRectF::fromDOMRect(source.call<emscripten::val>("getBoundingClientRect"));
     const auto targetBoundingRect =

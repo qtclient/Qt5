@@ -67,7 +67,47 @@ void qtRegisterEventHandlerJs(int index) {
     EM_ASM({
         let index = $0;
         let control = Module.qtSuspendResumeControl;
+        // A queued event can reach its C++ handler after the browser finished
+        // dispatching it. By then an event retargeted out of Qt's shadow DOM
+        // has target == null and composedPath() == [] (DOM "clear targets"),
+        // so pin both to their dispatch-time values while still in dispatch.
+        let pinDispatchState = (arg) => {
+            if (!(arg instanceof Event) || Object.getOwnPropertyDescriptor(arg, "target"))
+                return;
+            try {
+                const target = arg.target;
+                const path = arg.composedPath();
+                Object.defineProperty(arg, "target", { value: target, configurable: true });
+                Object.defineProperty(arg, "composedPath", { value: () => path, configurable: true });
+            } catch (e) {
+            }
+        };
+        // The C++ handler's preventDefault() is a no-op for a queued event, so
+        // cancel now the defaults Qt cancels when it handles the event in time:
+        //  - pointerdown on a Qt element: the default (compatibility) mousedown
+        //    moves focus off Qt's focus helper / IME input element, after which
+        //    key events never reach Qt (and the mobile keyboard closes again);
+        //  - contextmenu: Qt always suppresses the native menu;
+        //  - keydown outside IME composition and without Ctrl/Meta (native
+        //    clipboard and browser shortcuts stay native): Qt's focus targets
+        //    are editable, so a held key otherwise opens the macOS press-and-hold
+        //    accent popup.
+        let cancelLateDefaults = (arg) => {
+            if (!(arg instanceof Event) || !arg.cancelable || arg.defaultPrevented)
+                return;
+            const top = arg.composedPath()[0];
+            const cls = top && typeof top.className === "string" ? top.className : "";
+            if (!cls.startsWith("qt-"))
+                return;
+            if (arg.type === "pointerdown" || arg.type === "contextmenu")
+                arg.preventDefault();
+            else if (arg.type === "keydown" && !arg.isComposing && arg.keyCode !== 229
+                     && !arg.ctrlKey && !arg.metaKey)
+                arg.preventDefault();
+        };
         let handler = (arg) => {
+
+            pinDispatchState(arg);
 
             // Add event to event queue
             control.pendingEvents.push({
@@ -89,6 +129,7 @@ void qtRegisterEventHandlerJs(int index) {
                     // processed on the next processEvents() call.
                     // FIXME: call event handler here if we can determine that the instance
                     // is not suspended.
+                    cancelLateDefaults(arg);
                 } else {
                     // The instance is not suspended, call the handler directly
                     Module.qtSendPendingEvents();

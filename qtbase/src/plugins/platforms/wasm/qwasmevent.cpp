@@ -109,6 +109,9 @@ bool Event::isTargetedForQtElement() const
     // is needed to avoid capturing the pointer in cases where foreign html
     // elements are embedded inside Qt's shadow DOM.
     emscripten::val path = webEvent.call<emscripten::val>("composedPath");
+    // Empty once dispatch finished (an event handled late from the queue).
+    if (path["length"].as<int>() == 0)
+        return false;
     QString topElementClassName = QString::fromEcmaString(path[0]["className"]);
     return topElementClassName.startsWith("qt-"); // .e.g. qt-window-canvas
 }

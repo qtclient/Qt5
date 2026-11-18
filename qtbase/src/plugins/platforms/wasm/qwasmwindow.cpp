@@ -824,6 +824,12 @@ void QWasmWindow::processPointer(const PointerEvent &event)
     if (eventAccepted) {
         event.webEvent.call<void>("preventDefault");
         event.webEvent.call<void>("stopPropagation");
+    } else if (event.type == EventType::PointerDown && event.isTargetedForQtElement()) {
+        // A press no Qt item accepted (e.g. a right click on a left-button-only
+        // area) must still not run the browser default: its mousedown moves DOM
+        // focus off the focus helper / IME input element to <body>, and key
+        // events stop reaching Qt until something calls focus() again.
+        event.webEvent.call<void>("preventDefault");
     }
 }
 
