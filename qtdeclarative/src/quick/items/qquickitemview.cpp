@@ -148,7 +148,9 @@ QQuickItem *QQuickItemView::currentItem() const
 QVariant QQuickItemView::model() const
 {
     Q_D(const QQuickItemView);
-    if (d->ownModel)
+    // setModel() clears d->model while ownModel is still set and then moves the
+    // view; bindings reading model during that window must not dereference it.
+    if (d->ownModel && d->model)
         return static_cast<QQmlDelegateModel *>(d->model.data())->model();
     if (d->model)
         return QVariant::fromValue(d->model.data());
