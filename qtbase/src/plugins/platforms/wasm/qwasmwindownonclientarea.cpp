@@ -152,7 +152,8 @@ bool Resizer::ResizerElement::onPointerUp(const PointerEvent &event)
         return false;
 
     m_resizer->finishResize();
-    m_element.call<void>("releasePointerCapture", event.pointerId);
+    if (m_element.call<bool>("hasPointerCapture", event.pointerId))
+        m_element.call<void>("releasePointerCapture", event.pointerId);
     m_capturedPointerId = -1;
     return true;
 }
@@ -405,7 +406,8 @@ bool TitleBar::onPointerUp(const PointerEvent &event)
     if (m_capturedPointerId != event.pointerId)
         return false;
 
-    m_element.call<void>("releasePointerCapture", event.pointerId);
+    if (m_element.call<bool>("hasPointerCapture", event.pointerId))
+        m_element.call<void>("releasePointerCapture", event.pointerId);
     m_capturedPointerId = -1;
     m_window->onNonClientEvent(event);
     return true;

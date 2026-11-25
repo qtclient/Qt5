@@ -810,7 +810,12 @@ void QWasmWindow::processPointer(const PointerEvent &event)
                 window()->requestActivate();
         break;
     case EventType::PointerUp:
-        if (event.isTargetedForQtElement())
+        // Browsers (notably iOS Safari) may already have released capture when
+        // the virtual keyboard opens or the touch ends. Unguarded
+        // releasePointerCapture throws NotFoundError, which escapes Qt's event
+        // handler and aborts the wasm instance.
+        if (event.isTargetedForQtElement()
+            && m_window.call<bool>("hasPointerCapture", event.pointerId))
             m_window.call<void>("releasePointerCapture", event.pointerId);
         break;
     default:
