@@ -105,9 +105,44 @@ void qtRegisterEventHandlerJs(int index) {
                      && !arg.ctrlKey && !arg.metaKey)
                 arg.preventDefault();
         };
+        // iOS Safari only raises the keyboard for focus() on the user-gesture
+        // stack. JSPI queues pointerdown and C++ focuses the IME input after
+        // dispatch (resume() continues as a microtask too) — too late. When Qt
+        // already configured the input for text (inputMode !== "none", e.g.
+        // login forceActiveFocus), re-focus it here during the tap. Never use
+        // inputMode "none" as a "prime": Safari will not upgrade that session
+        // when C++ later sets a real mode.
+        let syncImeFocusOnGesture = (arg) => {
+            if (!(arg instanceof Event) || arg.type !== "pointerdown")
+                return;
+            if (arg.pointerType !== "touch" && arg.pointerType !== "pen")
+                return;
+            try {
+                const path = arg.composedPath();
+                for (const node of path) {
+                    if (!node || !node.classList || !node.classList.contains("qt-window"))
+                        continue;
+                    const input = node.querySelector(":scope > .qt-window-input-element");
+                    if (!input)
+                        break;
+                    const mode = input.inputMode || "text";
+                    if (mode === "none")
+                        break;
+                    let active = document.activeElement;
+                    while (active && active.shadowRoot && active.shadowRoot.activeElement)
+                        active = active.shadowRoot.activeElement;
+                    if (active === input)
+                        input.blur();
+                    input.focus({ preventScroll: true });
+                    break;
+                }
+            } catch (e) {
+            }
+        };
         let handler = (arg) => {
 
             pinDispatchState(arg);
+            syncImeFocusOnGesture(arg);
 
             // Add event to event queue
             control.pendingEvents.push({
