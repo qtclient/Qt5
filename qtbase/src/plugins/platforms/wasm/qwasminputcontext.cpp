@@ -311,10 +311,18 @@ void QWasmInputContext::updateInputElement()
 
     QInputMethodQueryEvent query((Qt::InputMethodQueries(Qt::ImHints)));
     QCoreApplication::sendEvent(m_focusObject, &query);
-    if (Qt::InputMethodHints(query.value(Qt::ImHints).toInt()).testFlag(Qt::ImhHiddenText))
-        m_inputElement.set("type", "password");
-    else
-        m_inputElement.set("type", "text");
+    // iOS dismisses the keyboard when a focused <input>'s type changes
+    // (login email echoMode ↔ password). Only write type when it differs.
+    {
+        const bool hidden = Qt::InputMethodHints(query.value(Qt::ImHints).toInt())
+                                    .testFlag(Qt::ImhHiddenText);
+        const std::string wantType = hidden ? "password" : "text";
+        const std::string curType = m_inputElement["type"].isString()
+                ? m_inputElement["type"].as<std::string>()
+                : std::string();
+        if (curType != wantType)
+            m_inputElement.set("type", wantType);
+    }
 
 // change inputmode to suit Qt imhints
 
